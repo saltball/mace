@@ -42,32 +42,83 @@ def compute_forces(
 def compute_forces_virials(
     energy: torch.Tensor,
     positions: torch.Tensor,
+    batch: torch.Tensor,
     displacement: torch.Tensor,
+    edge_index: torch.Tensor,
+    vectors: torch.Tensor,    
     cell: torch.Tensor,
     training: bool = True,
     compute_stress: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(energy)]
-    forces, virials = torch.autograd.grad(
+    forces, vector_force = torch.autograd.grad(
         outputs=[energy],  # [n_graphs, ]
-        inputs=[positions, displacement],  # [n_nodes, 3]
+        inputs=[positions, vectors],  # [n_nodes, 3]
         grad_outputs=grad_outputs,
         retain_graph=training,  # Make sure the graph is not destroyed during training
         create_graph=training,  # Create graph for second derivative
         allow_unused=True,
     )
+
+    if vector_force is not None and vectors is not None:
+        edge_virial = torch.einsum("zi,zj->zij", vector_force, vectors)
+    else:
+        edge_virial = None
+
+    if edge_virial is not None and edge_index[0] is not None:
+        atom_virial = scatter_sum(edge_virial, edge_index[0], dim=0, dim_size=len(positions),)
+    else:
+        atom_virial = None
+
+    if edge_virial is not None and edge_index[1] is not None:
+        scattered_virial = scatter_sum(edge_virial, edge_index[1], dim=0, dim_size=len(positions))
+        if atom_virial is not None:
+            atom_virial = (atom_virial + scattered_virial) / 2
+        else:
+            atom_virial = None
+    else:
+        atom_virial = None
+
+    if atom_virial is not None and batch is not None:
+        virials = scatter_sum(atom_virial, batch, dim=0,)
+    else:
+        virials = None
+
+
+    if virials is not None:
+        virials = (virials + virials.transpose(-1, -2)) / 2
+    else:
+        # Handle the case when virials is None, perhaps by setting it to zero or some default value
+        virials = torch.zeros_like(displacement)
+
+
     stress = torch.zeros_like(displacement)
     if compute_stress and virials is not None:
         cell = cell.view(-1, 3, 3)
         volume = torch.linalg.det(cell).abs().unsqueeze(-1)
         stress = virials / volume.view(-1, 1, 1)
         stress = torch.where(torch.abs(stress) < 1e10, stress, torch.zeros_like(stress))
+
+
+    if atom_virial is None:
+        atom_virial = torch.zeros_like(torch.empty((1, 3, 3)))
+
     if forces is None:
         forces = torch.zeros_like(positions)
+
     if virials is None:
         virials = torch.zeros((1, 3, 3))
 
-    return -1 * forces, -1 * virials, stress
+    if vector_force is None:
+        vector_force = torch.zeros((1,3))
+
+    if edge_virial is None:
+        edge_virial = torch.zeros((1,3,3))
+
+    if atom_virial is None:
+        atom_virial = torch.zeros((1,3,3))
+
+    return -1 * forces, -1 * virials, stress, -1 * atom_virial
 
 
 def get_symmetric_displacement(
@@ -166,7 +217,10 @@ def compute_hessians_loop(
 def get_outputs(
     energy: torch.Tensor,
     positions: torch.Tensor,
-    displacement: Optional[torch.Tensor],
+    batch: torch.Tensor,
+    displacement: torch.Tensor,
+    edge_index: torch.Tensor,
+    vectors: torch.Tensor,
     cell: torch.Tensor,
     training: bool = False,
     compute_force: bool = True,
@@ -176,20 +230,26 @@ def get_outputs(
 ) -> Tuple[
     Optional[torch.Tensor],
     Optional[torch.Tensor],
+    Optional[torch.Tensor], 
     Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
-    if (compute_virials or compute_stress) and displacement is not None:
-        forces, virials, stress = compute_forces_virials(
+
+    if (compute_virials or compute_stress) and vectors is not None:
+        forces, virials, stress, atom_virial = compute_forces_virials(
             energy=energy,
             positions=positions,
+            batch=batch,
             displacement=displacement,
+            edge_index=edge_index,
+            vectors=vectors,
             cell=cell,
             compute_stress=compute_stress,
             training=(training or compute_hessian),
         )
+
     elif compute_force:
-        forces, virials, stress = (
+        forces, virials, stress, atom_virial = (
             compute_forces(
                 energy=energy,
                 positions=positions,
@@ -197,15 +257,16 @@ def get_outputs(
             ),
             None,
             None,
+            None,
         )
     else:
-        forces, virials, stress = (None, None, None)
+        forces, virials, stress, atom_virial = (None, None, None, None)
     if compute_hessian:
         assert forces is not None, "Forces must be computed to get the hessian"
         hessian = compute_hessians_vmap(forces, positions)
     else:
         hessian = None
-    return forces, virials, stress, hessian
+    return forces, virials, stress, hessian, atom_virial
 
 
 def get_edge_vectors_and_lengths(
